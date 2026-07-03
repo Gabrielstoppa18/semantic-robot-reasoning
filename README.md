@@ -20,7 +20,7 @@ Four separable stages, each meant to be developed and swapped independently:
 | Perception (detect/localize objects) | [`perception/`](perception/) | stereo color-blob XYZ localization |
 | Semantic grounding (LLM infers object roles) | [`reasoning/`](reasoning/) | not started |
 | Reasoning & planning (LLM produces action sequence) | [`reasoning/`](reasoning/) | not started |
-| Action execution (robot motion commands) | [`action/`](action/) | not started |
+| Action execution (robot motion commands) | [`action/`](action/) | IK-driven pick-and-place (hardcoded fire-onto-water) |
 
 [`simulation/`](simulation/) is the glue/infrastructure layer: it builds the
 CoppeliaSim scene and holds the remote API connection helper shared by the
@@ -58,6 +58,11 @@ With CoppeliaSim open on a new/empty scene:
 ```bash
 python -m simulation.build_scene         # builds the cubes, UR5+RG2, and stereo cameras
 python -m perception.stereo_localization # estimates each cube's XYZ from the two cameras
+python -m action.pick_and_place          # picks up fire_cube, places it on top of water_cube
+
+# IK/motion smoke test, robot only (no perception/grasping):
+python -m simulation.build_scene --no-cubes --no-cameras
+python -m action.test_ik_motion
 ```
 
 ## Development
@@ -74,7 +79,7 @@ pytest            # run tests
 simulation/    CoppeliaSim scene-building and remote API connection
 perception/    object detection / 3D localization
 reasoning/     LLM integration, semantic grounding, action planning (not started)
-action/        action-to-robot-command translation, motion control (not started)
+action/        IK-driven pick-and-place (simIK + RG2 gripper control)
 tests/         unit tests for the pure-logic parts of each stage
 docs/          thesis notes, references, experiment logs
 ```
