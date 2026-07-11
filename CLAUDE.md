@@ -37,13 +37,20 @@ CoppeliaSim's Python remote API (ZMQ remote API) — no ROS2 for now.
 
 ## Status
 
-Perception, simulation, and action scaffolding exist; only the reasoning (LLM)
-stage is not started yet (its package exists as an empty stub).
+Perception, simulation, and action are working end-to-end. Reasoning has a
+first slice — a local vision-language model (VLM) that can describe the
+scene and identify/locate a named object by color — but not yet the full
+semantic-grounding example (inferring "extinguish the fire" means "place
+water cube on fire cube" from an open instruction); see "Next steps" below.
+A Gradio dashboard (`dashboard/app.py`) ties this together with a chat box,
+live stereo camera views with VLM bounding-box overlays, and perceived cube
+positions.
 
 /perception    # color-based stereo XYZ localization of the cubes (perception/stereo_localization.py)
-/reasoning     # not started — LLM integration, prompting, semantic grounding, planning
+/reasoning     # local VLM (Ollama) scene description + object grounding (reasoning/vlm_client.py, scene_recognition.py, vlm_pick_and_place.py); semantic instruction parsing/planning not started
 /action        # IK-driven pick-and-place using perceived cube positions (action/pick_and_place.py)
 /simulation    # CoppeliaSim scene-building and remote API connection (simulation/build_scene.py, connection.py, geometry.py)
+/dashboard     # Gradio web UI: chat-driven task input + live camera/bbox/position display (dashboard/app.py)
 /tests         # unit tests for the pure-logic parts of each stage (no CoppeliaSim needed to run them)
 /docs          # thesis notes, references, experiment logs (not started)
 
@@ -66,6 +73,14 @@ python -m venv .venv
 pip install -e ".[dev]"
 ```
 
+Also requires [Ollama](https://ollama.com) installed and running locally
+(listens on `http://localhost:11434` by default; no config needed) with a
+vision-capable model pulled for the reasoning stage:
+
+```bash
+ollama pull llava
+```
+
 ## Common commands
 
 ```bash
@@ -74,6 +89,9 @@ python -m simulation.build_scene --no-cubes --no-cameras  # robot + pedestal onl
 python -m perception.stereo_localization # requires the scene above to already be built
 python -m action.pick_and_place          # requires the full scene; picks up fire_cube, places it on water_cube
 python -m action.test_ik_motion          # requires the robot-only scene; IK/motion smoke test, no perception/grasping
+python -m reasoning.scene_recognition    # requires the full scene + Ollama running; VLM describes the scene, locates the blue cube
+python -m reasoning.vlm_pick_and_place   # requires the full scene + Ollama running; VLM identifies the blue cube, robot moves it
+python -m dashboard.app                  # requires the full scene + Ollama running; web UI at http://127.0.0.1:7860
 ruff check .                             # lint
 ruff format .                            # format
 pytest                                   # run tests (single test: pytest tests/test_geometry.py::test_normalize_unit_length)
@@ -151,6 +169,120 @@ rendering convention ever changes.
 This is intentionally the simplest possible perception approach (color blobs, not
 a learned detector) to get an end-to-end pipeline working first. Swapping in a
 real object detector later should only require replacing `detect_color_centroid`.
+
+## Reasoning (`reasoning/`)
+
+A local vision-language model (VLM), served by [Ollama](https://ollama.com)
+running on the same machine (`ollama pull llava`, then Ollama's background
+service handles the rest — no API key, no network dependency). Chosen over a
+hosted LLM API specifically so the reasoning stage can run free and offline;
+swapping in a hosted API later should only require replacing
+`reasoning/vlm_client.py`'s two functions.
+
+- **The model is `llava`, not `llama3.2-vision`, because this Ollama build
+  (0.31.2, installed via `winget`, no newer version available at the time)
+  cannot load `llama3.2-vision` at all** — `ollama run llama3.2-vision`
+  itself fails server-side with `error loading model: unknown model
+  architecture: 'mllama'`, confirmed independent of this project's code.
+  `llava` uses a different, more mature code path in this Ollama build and
+  works fine. Re-check whether `llama3.2-vision` (or a newer vision model)
+  works before assuming this limitation still applies if Ollama is upgraded.
+- **`vlm_client.py`** is the only module that talks to Ollama directly
+  (`ollama.chat`, via the `ollama` PyPI package — not raw HTTP). `ask()`
+  returns free-text; `ask_json()` passes a JSON schema as the `format`
+  argument (Ollama's structured-output support) and returns it pre-parsed —
+  much more reliable than asking the model to "please respond with JSON" in
+  the prompt and hoping, especially for something as structured as a
+  bounding box.
+- **`scene_recognition.py`** builds on that with two capabilities:
+  `describe_scene()` (open-ended "what do you see" — the scene-recognition
+  capability check) and `locate_object(sim, label)` (asks the VLM for a
+  bounding box of a named object, normalized 0.0-1.0, converted to pixel
+  coordinates using the actual captured image's resolution).
+  - **The VLM's bounding box is a coarse identification signal, not a
+    replacement for `perception.stereo_localization`.** VLMs are not
+    reliable at precise spatial localization (a well-known general
+    limitation, not specific to `llava`) — the ~1mm-accurate
+    stereo-triangulation pipeline is what `action.pick_and_place` actually
+    grasps with. Confirmed empirically: `llava`'s bounding box for "the blue
+    cube" against this scene's actual layout was noticeably off (centered
+    between both cubes rather than on the blue one), even though its `found`/
+    `label` answer was correct. The VLM's job is answering "which object, by
+    color/shape/language, is this" from the image; precise XYZ still comes
+    from the existing validated perception module. `reasoning/vlm_pick_and_place.py`
+    is the concrete example of this split: it asks the VLM which cube is
+    "the blue cube" (and prints the VLM's bounding box for inspection), maps
+    that back to this scene's ground-truth cube name via a simple
+    color-word lookup (`_COLOR_TO_CUBE_NAME`), then gets that cube's actual
+    XYZ from `perception.stereo_localization.locate_cubes` before calling
+    `action.pick_and_place.pick_and_place`.
+  - **Ollama's structured-output `format` parameter is a JSON schema dict,
+    not a Pydantic model or a string.** Passing an object schema with
+    `required: ["found", "label", "bbox_normalized"]` reliably gets back
+    parseable JSON on the first try; this is meaningfully more robust than
+    parsing free text for something with a fixed shape like a bounding box.
+- **`vlm_pick_and_place.py`** is intentionally a *smaller* task than the
+  thesis's fire/water example: pick up whichever cube the VLM identifies as
+  a given color, place it 15cm over in +Y (still on the floor, at half the
+  cube's height, matching how `simulation.build_scene.WATER_CUBE_POS`/`FIRE_CUBE_POS`
+  are defined) — clear of the other cube, well within the workspace
+  `action.pick_and_place` already exercises. This is meant as the next
+  stepping stone (perceive → ground a language reference to a concrete
+  object → act) before adding open-instruction semantic reasoning (inferring
+  "extinguish the fire" without hardcoding what that means) on top.
+  `locate_and_move(sim, target_label)` is the reusable piece (VLM lookup +
+  cube-name mapping + perception XYZ + `action.pick_and_place` call, raising
+  `RuntimeError` if any step fails); `main()` and `dashboard/app.py` both
+  call it rather than duplicating that sequence.
+- **`instruction_parsing.py`** pulls a target color ("blue"/"red") out of a
+  free-text instruction via a plain keyword lookup, bilingual (English +
+  Portuguese, since the dashboard this feeds is used in Portuguese) — not an
+  LLM call. The VLM's job stays *visual* grounding (which pixels are the
+  blue cube); picking the color word out of the user's own already-written
+  text doesn't need a model.
+
+## Dashboard (`dashboard/app.py`)
+
+A [Gradio](https://gradio.dev) web UI (`python -m dashboard.app`, serves at
+`http://127.0.0.1:7860`) tying the above together: a chat box to type
+instructions, the two stereo camera views (with the VLM's bounding box for
+whatever it most recently identified overlaid via `gr.AnnotatedImage`), and
+the live perceived cube XYZ positions (`gr.JSON`).
+
+- **The chat only understands "mentions a color" instructions** — it runs
+  `reasoning.instruction_parsing.extract_target_color` on the typed message,
+  and if a color is found, calls `reasoning.vlm_pick_and_place.locate_and_move`
+  with `"the {color} cube"`. This is a UI shell around the existing
+  perceive → ground → act pieces, not a new reasoning capability — see
+  "Next steps" below for what open-instruction parsing would need to add.
+- **`gr.Chatbot`/`gr.AnnotatedImage` value formats are worth checking against
+  the installed Gradio version before assuming an API shape.** This project
+  pins `gradio>=5.0` but was built/tested against 6.20: `gr.Chatbot` only
+  accepts the OpenAI-style `{"role": ..., "content": ...}` message dicts in
+  this version (the older `[[user, bot], ...]` tuple-pairs format isn't
+  accepted), and `gr.AnnotatedImage`'s value is `(image, [(bbox, label), ...])`
+  with `bbox` as a plain `(x_min, y_min, x_max, y_max)` int tuple.
+- **A `threading.Lock` guards every `sim.*` call the dashboard makes.**
+  `action.pick_and_place.Arm` drives the sim with `sim.setStepping(True)` for
+  the whole duration of a move (many `sim.step()` calls in sequence, taking
+  real wall-clock seconds); Gradio runs each event handler (button click,
+  textbox submit, the periodic refresh timer) in its own thread, and nothing
+  guarantees `RemoteAPIClient` is safe to call concurrently from multiple
+  threads on the same connection. Without the lock, the periodic camera
+  refresh firing mid-move would be a race on the same ZMQ socket.
+- **Camera images auto-refresh via a shared `gr.Timer`, not per-component
+  `every=`.** A single `gr.Timer(REFRESH_INTERVAL_SECONDS)` firing one
+  `.tick()` callback that returns all three outputs (both camera views +
+  the values JSON) together is simpler than wiring up three independent
+  polling callbacks, and keeps them consistent with each other (same instant
+  in the sim, not three separately-timed snapshots).
+- **The bounding-box annotation is only ever for the most recently
+  identified object, not a live-tracked overlay** — it comes from the VLM
+  detection returned by the *last* chat submission, cleared back to no
+  annotation on every periodic timer refresh (since the timer's refresh
+  callback has no detection to draw). If persistent tracking-style overlays
+  are ever wanted, the detection would need to be cached in a shared
+  variable and passed into every refresh call, not just chat ones.
 
 ## Action (`action/pick_and_place.py`)
 
@@ -289,15 +421,23 @@ it was replaced matters for not reintroducing it.
 
 - Language: Python 3.10+
 - Simulation: CoppeliaSim, driven standalone via its Python remote API (ZMQ remote API) — no ROS2/Gazebo for now
-- LLM interface: external API (e.g. Anthropic/OpenAI) — no local model
+- LLM interface: local VLM via [Ollama](https://ollama.com) (currently `llava`) — free/offline, chosen over a hosted API for this reason; see "Reasoning" above
 - Robot/hardware target: simulation only — no physical robot execution
 - Lint/format: Ruff; tests: pytest (config lives in `pyproject.toml`, not separate ini files)
 
 ## Next steps for this file
 
-Once the reasoning stage exists, update this file to add:
+`reasoning/vlm_pick_and_place.py` (and `dashboard/app.py`'s chat, which is
+just a UI wrapper around it) grounds a color keyword to a concrete object,
+but doesn't yet parse an open natural-language instruction or reason about
+semantic roles ("water"/"fire") the way the thesis's canonical example
+needs. Once that exists, update this file to add:
 
-- How the LLM is prompted for semantic grounding and action planning
-- How the LLM's output plan maps onto `action.pick_and_place`'s pick/place calls
-  (right now the pick/place objects and positions are hardcoded to
-  fire_cube-onto-water_cube, not derived from an instruction)
+- How the VLM is prompted for open-instruction semantic grounding (inferring
+  which object is "water"/"fire" from the instruction, not a fixed label)
+  and action planning (producing a pick/place sequence, not just one lookup)
+- How that plan maps onto `action.pick_and_place`'s pick/place calls (right
+  now the pick/place objects and positions there are hardcoded to
+  fire_cube-onto-water_cube; `vlm_pick_and_place.py` is a first step away
+  from that, but still only handles a single fixed "pick the named-color
+  cube, move it over" case, not an arbitrary instruction)

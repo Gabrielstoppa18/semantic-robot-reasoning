@@ -9,6 +9,8 @@ dependencies = [
     "coppeliasim-zmqremoteapi-client>=2.0",
     "numpy>=1.26",
     "opencv-python>=4.9",
+    "ollama>=0.6",
+    "gradio>=5.0",
 ]
 
 [project.optional-dependencies]
@@ -22,7 +24,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["simulation", "perception", "reasoning", "action"]
+packages = ["simulation", "perception", "reasoning", "action", "dashboard"]
 
 [tool.ruff]
 line-length = 100

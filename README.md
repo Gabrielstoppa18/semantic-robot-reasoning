@@ -18,20 +18,23 @@ Four separable stages, each meant to be developed and swapped independently:
 | Stage | Package | Status |
 |---|---|---|
 | Perception (detect/localize objects) | [`perception/`](perception/) | stereo color-blob XYZ localization |
-| Semantic grounding (LLM infers object roles) | [`reasoning/`](reasoning/) | not started |
-| Reasoning & planning (LLM produces action sequence) | [`reasoning/`](reasoning/) | not started |
+| Semantic grounding (LLM infers object roles) | [`reasoning/`](reasoning/) | local VLM describes the scene and locates a named object |
+| Reasoning & planning (LLM produces action sequence) | [`reasoning/`](reasoning/) | not started (single grounded pick/place only) |
 | Action execution (robot motion commands) | [`action/`](action/) | IK-driven pick-and-place (hardcoded fire-onto-water) |
 
 [`simulation/`](simulation/) is the glue/infrastructure layer: it builds the
 CoppeliaSim scene and holds the remote API connection helper shared by the
-other stages.
+other stages. [`dashboard/`](dashboard/) is a Gradio web UI tying them
+together: a chat box for task instructions, live stereo camera views with
+VLM bounding-box overlays, and perceived cube positions.
 
 ## Stack
 
 - **Language:** Python 3.10+
 - **Simulator:** [CoppeliaSim](https://www.coppeliarobotics.com/) (Edu), driven
   standalone via its Python ZeroMQ remote API — no ROS2/Gazebo for now
-- **LLM:** external API (e.g. Anthropic/OpenAI) — no local model
+- **LLM:** local vision-language model via [Ollama](https://ollama.com)
+  (`llava`) — free and offline, no API key
 - **Robot/hardware target:** simulation only (UR5 arm + RG2 gripper) — no
   physical robot execution
 - **Tooling:** [Ruff](https://docs.astral.sh/ruff/) (lint + format),
@@ -41,7 +44,8 @@ other stages.
 
 Requires [CoppeliaSim Edu](https://www.coppeliarobotics.com/) installed locally
 (the ZeroMQ remote API server starts automatically with it — no extra
-configuration needed).
+configuration needed), and [Ollama](https://ollama.com) installed and running
+locally with a vision model pulled.
 
 ```bash
 python -m venv .venv
@@ -49,6 +53,8 @@ python -m venv .venv
 # source .venv/bin/activate     # macOS/Linux
 
 pip install -e ".[dev]"
+
+ollama pull llava
 ```
 
 ## Usage
@@ -63,6 +69,13 @@ python -m action.pick_and_place          # picks up fire_cube, places it on top 
 # IK/motion smoke test, robot only (no perception/grasping):
 python -m simulation.build_scene --no-cubes --no-cameras
 python -m action.test_ik_motion
+
+# VLM scene recognition + grounded pick-and-place (requires Ollama running):
+python -m reasoning.scene_recognition
+python -m reasoning.vlm_pick_and_place
+
+# Web dashboard: chat + live camera views + bounding boxes (requires Ollama running):
+python -m dashboard.app   # serves at http://127.0.0.1:7860
 ```
 
 ## Development
@@ -78,8 +91,9 @@ pytest            # run tests
 ```
 simulation/    CoppeliaSim scene-building and remote API connection
 perception/    object detection / 3D localization
-reasoning/     LLM integration, semantic grounding, action planning (not started)
+reasoning/     local VLM (Ollama) scene description + object grounding; open-instruction planning not started
 action/        IK-driven pick-and-place (simIK + RG2 gripper control)
+dashboard/     Gradio web UI: chat-driven task input + live camera/bbox/position display
 tests/         unit tests for the pure-logic parts of each stage
 docs/          thesis notes, references, experiment logs
 ```
